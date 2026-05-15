@@ -1,0 +1,449 @@
+//+------------------------------------------------------------------+
+//|                                            MoneyMachine7.mq5    |
+//|  v17.17 — SCALPING PURO TRI-SESSION: SL=0.50 TP=1.00           |
+//|                                                                  |
+//|  DIAGNÓSTICO v17.16: Net=-$273 | SL Asia=30pts | SL NY=1.50pts |
+//|  CAUSA: SL proporcional al rango = swing, no scalping           |
+//|  CAUSA: NY_SL_FIXED=0.50 pero el código usaba 1.50             |
+//|                                                                  |
+//|  REGLA FUNDAMENTAL SCALPING XAUUSD M1:                         |
+//|  SL = 0.50 pts | TP = 1.00 pts | R:R = 1:2                     |
+//|  Esta es la única configuración probada que funciona            |
+//|  (v17.10: +$14.50, PF=2.46, WR=57%)                            |
+//|                                                                  |
+//|  ARQUITECTURA v17.17:                                           |
+//|                                                                  |
+//|  ASIA  00:00-05:00 UTC — EMA scalp en rango                    |
+//|  Misma señal EMA3/8+EMA21 pero solo si precio está              |
+//|  dentro del rango asiático (no en breakout)                     |
+//|  SL=0.50 TP=1.00 — scalping puro                               |
+//|                                                                  |
+//|  LONDON  07:00-12:00 UTC — EMA scalp en breakout               |
+//|  Misma señal EMA3/8+EMA21 pero solo si precio está              |
+//|  fuera del rango asiático (breakout confirmado)                 |
+//|  SL=0.50 TP=1.00 — scalping puro                               |
+//|                                                                  |
+//|  NY  13:00-18:30 UTC — EMA scalp momentum                      |
+//|  La estrategia probada con 75% WR                               |
+//|  SL=0.50 TP=1.00 — scalping puro                               |
+//|                                                                  |
+//|  DIFERENCIADOR POR SESIÓN: el contexto (rango vs breakout)     |
+//|  no el SL/TP — eso siempre es 0.50/1.00                        |
+//+------------------------------------------------------------------+
+#property copyright "MoneyMachine7"
+#property version   "17.17"
+#property strict
+
+input bool   Control_orders_user        = true;
+input string CommentOrder               = "MM7";
+input bool   Use_dynamic_lot_           = true;
+input double Lot_                       = 0.01;
+input double Free_margin_for_each_Lots_ = 1000.0;
+input double Max_Lot_                   = 5.0;
+input int    InpMagicNumber             = 171700;
+input int    InpSlippagePoints          = 10;
+input int    InpMaxSpreadPoints         = 600;
+
+// --- SCALPING UNIVERSAL: mismo SL/TP para todas las sesiones ---
+input double Scalp_SL                   = 0.50;  // SL fijo 0.50pts
+input double Scalp_TP                   = 1.00;  // TP fijo 1.00pts — R:R 1:2
+
+// --- EMA Signal (compartida por todas las sesiones) ---
+input int    EMA_Fast                   = 3;
+input int    EMA_Slow                   = 8;
+input int    EMA_Trend                  = 21;
+
+// --- ASIA 00:00-05:00 UTC ---
+input bool   Asia_Enable                = true;
+input int    Asia_End_Hour              = 5;
+input int    Asia_Max_Trades            = 3;     // hasta 3 scalps por sesión Asia
+input int    Asia_Cooldown_Secs         = 60;
+
+// --- LONDON 07:00-12:00 UTC ---
+input bool   London_Enable              = true;
+input int    London_Start_Hour          = 7;
+input int    London_End_Hour            = 12;
+input int    London_Max_Trades          = 4;
+input int    London_Cooldown_Secs       = 60;
+
+// --- NY 13:00-18:30 UTC ---
+input bool   NY_Enable                  = true;
+input int    NY_Start_Hour              = 13;
+input int    NY_Start_Min               = 0;
+input int    NY_End_Hour                = 18;
+input int    NY_End_Min                 = 30;
+input int    NY_Max_Trades              = 6;
+input int    NY_Cooldown_Secs           = 60;
+input int    NY_SL_Cooldown_Secs        = 30;
+
+// --- Money Management ---
+input double InpMaxDailyLossPct         = 5.0;
+input double InpMaxEquityDrawdown       = 10.0;
+
+// --- Dashboard ---
+input bool   Enable_Dashboard           = true;
+input int    Dashboard_Corner           = 0;
+input int    Dashboard_X                = 10;
+input int    Dashboard_Y                = 30;
+input int    Font_Size                  = 10;
+input bool   Enable_History_Labels      = true;
+
+//============================================================
+// GLOBALES
+//============================================================
+int    g_magic; string g_sym; double g_point;
+int    g_hEMAf=INVALID_HANDLE, g_hEMAs=INVALID_HANDLE, g_hEMAt=INVALID_HANDLE;
+
+datetime g_lastBar     = 0;
+datetime g_dayStart    = 0;
+double   g_dayStartBal = 0;
+bool     g_haltedToday = false;
+
+// Rango asiático (construido 00:00-06:59 para contexto)
+double   g_asiaHigh = 0, g_asiaLow = 1e10;
+bool     g_asiaReady = false;
+
+// Contadores de trades por sesión (reset diario)
+int      g_asiaTrades = 0, g_lonTrades = 0, g_nyTrades = 0;
+
+// Cooldowns por sesión
+datetime g_asiaLastEntry = 0, g_asiaLastSL = 0;
+datetime g_lonLastEntry  = 0, g_lonLastSL  = 0;
+datetime g_nyLastEntry   = 0, g_nyLastSL   = 0;
+
+// Señal calculada por barra
+int      g_sig = 0;
+double   g_EMAf = 0, g_EMAs = 0;
+
+// Dashboard
+datetime g_lastDash = 0, g_lastLabel = 0;
+
+//============================================================
+// UTILIDADES
+//============================================================
+int  GetHour()   { MqlDateTime d; TimeToStruct(TimeCurrent(),d); return d.hour; }
+int  GetNowMin() { MqlDateTime d; TimeToStruct(TimeCurrent(),d); return d.hour*60+d.min; }
+
+double CalcLot()
+{
+   if(!Use_dynamic_lot_) return NormalizeDouble(Lot_,2);
+   double bal=(bool)MQLInfoInteger(MQL_TESTER)
+              ?AccountInfoDouble(ACCOUNT_BALANCE)
+              :MathMin(AccountInfoDouble(ACCOUNT_BALANCE),AccountInfoDouble(ACCOUNT_EQUITY));
+   double lot=MathRound(bal/Free_margin_for_each_Lots_)*0.01;
+   double mn=SymbolInfoDouble(g_sym,SYMBOL_VOLUME_MIN);
+   double mx=SymbolInfoDouble(g_sym,SYMBOL_VOLUME_MAX);
+   double st=SymbolInfoDouble(g_sym,SYMBOL_VOLUME_STEP);
+   lot=MathMax(lot,mn); lot=MathMin(lot,MathMin(Max_Lot_,mx));
+   if(st>0) lot=MathFloor(lot/st)*st;
+   return NormalizeDouble(lot,2);
+}
+
+int CountByMagic()
+{
+   int n=0;
+   for(int i=0;i<PositionsTotal();i++){
+      ulong tk=PositionGetTicket(i);
+      if(PositionSelectByTicket(tk)&&(int)PositionGetInteger(POSITION_MAGIC)==g_magic) n++;
+   }
+   return n;
+}
+
+bool SpreadOK()
+{ return ((SymbolInfoDouble(g_sym,SYMBOL_ASK)-SymbolInfoDouble(g_sym,SYMBOL_BID))/g_point<=InpMaxSpreadPoints); }
+
+ulong SendScalp(ENUM_ORDER_TYPE type, int dir, string cmt)
+{
+   double ask=SymbolInfoDouble(g_sym,SYMBOL_ASK);
+   double bid=SymbolInfoDouble(g_sym,SYMBOL_BID);
+   double entry=(type==ORDER_TYPE_BUY)?ask:bid;
+   int digs=(int)SymbolInfoInteger(g_sym,SYMBOL_DIGITS);
+   double sl=NormalizeDouble(entry - dir*Scalp_SL, digs);
+   double tp=NormalizeDouble(entry + dir*Scalp_TP, digs);
+   MqlTradeRequest req={}; MqlTradeResult res={};
+   req.action=TRADE_ACTION_DEAL; req.symbol=g_sym; req.volume=CalcLot();
+   req.type=type; req.price=entry; req.sl=sl; req.tp=tp;
+   req.deviation=InpSlippagePoints; req.magic=g_magic; req.comment=cmt;
+   req.type_filling=ORDER_FILLING_FOK;
+   if(!OrderSend(req,res)){req.type_filling=ORDER_FILLING_IOC; OrderSend(req,res);}
+   if(res.retcode==TRADE_RETCODE_DONE||res.retcode==TRADE_RETCODE_PLACED) return res.order;
+   return 0;
+}
+
+void DailyReset()
+{
+   datetime today=StringToTime(TimeToString(TimeCurrent(),TIME_DATE));
+   if(today==g_dayStart) return;
+   g_dayStart   =today;
+   g_dayStartBal=MathMin(AccountInfoDouble(ACCOUNT_BALANCE),AccountInfoDouble(ACCOUNT_EQUITY));
+   g_haltedToday=false;
+   g_asiaHigh=0; g_asiaLow=1e10; g_asiaReady=false;
+   g_asiaTrades=0; g_lonTrades=0; g_nyTrades=0;
+   g_sig=0;
+}
+
+void CheckHalt()
+{
+   if(g_haltedToday) return;
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(g_dayStartBal<=0) return;
+   double pct=(g_dayStartBal-eq)/g_dayStartBal*100.0;
+   if(InpMaxEquityDrawdown>0&&pct>=InpMaxEquityDrawdown){g_haltedToday=true;Print("MM7 HALT DD");return;}
+   if(InpMaxDailyLossPct>0&&pct>=InpMaxDailyLossPct){g_haltedToday=true;Print("MM7 HALT DL");}
+}
+
+//============================================================
+// SEÑAL EMA — calculada una vez por barra, compartida
+//============================================================
+void CalcSignal()
+{
+   g_sig=0;
+   if(g_hEMAf==INVALID_HANDLE||g_hEMAs==INVALID_HANDLE||g_hEMAt==INVALID_HANDLE) return;
+   int s=(bool)MQLInfoInteger(MQL_TESTER)?0:1;
+   double ef[],es[],et[];
+   ArraySetAsSeries(ef,true); ArraySetAsSeries(es,true); ArraySetAsSeries(et,true);
+   if(CopyBuffer(g_hEMAf,0,s,3,ef)<3) return;
+   if(CopyBuffer(g_hEMAs,0,s,3,es)<3) return;
+   if(CopyBuffer(g_hEMAt,0,s,1,et)<1) return;
+   g_EMAf=ef[0]; g_EMAs=es[0];
+   double bid=SymbolInfoDouble(g_sym,SYMBOL_BID);
+   bool crossUp  =(ef[0]>es[0]&&ef[1]<=es[1]);
+   bool crossDown=(ef[0]<es[0]&&ef[1]>=es[1]);
+   if(crossUp   && bid>et[0]) g_sig=1;
+   if(crossDown && bid<et[0]) g_sig=-1;
+}
+
+void BuildAsiaRange()
+{
+   // Construir rango asiático durante 00:00-06:59
+   int h=GetHour();
+   if(h>=0 && h<London_Start_Hour)
+   {
+      double hi[],lo[];
+      ArraySetAsSeries(hi,true); ArraySetAsSeries(lo,true);
+      if(CopyHigh(g_sym,_Period,1,1,hi)>=1&&CopyLow(g_sym,_Period,1,1,lo)>=1)
+      { if(hi[0]>g_asiaHigh)g_asiaHigh=hi[0]; if(lo[0]<g_asiaLow)g_asiaLow=lo[0]; }
+   }
+   if(!g_asiaReady && g_asiaHigh>0 && g_asiaLow<1e9 && (g_asiaHigh-g_asiaLow)>=0.30)
+      g_asiaReady=true;
+}
+
+//============================================================
+// ENTRADAS POR SESIÓN — todas usan SendScalp (SL=0.50, TP=1.00)
+//============================================================
+
+// ASIA: señal EMA dentro del rango asiático (mercado en consolidación)
+void Asia_TryEntry()
+{
+   if(!Asia_Enable) return;
+   if(g_sig==0) return;
+   if(g_asiaTrades>=Asia_Max_Trades) return;
+   if(CountByMagic()>0) return;
+   if(TimeCurrent()-g_asiaLastEntry<Asia_Cooldown_Secs) return;
+   if(TimeCurrent()-g_asiaLastSL<120) return;
+   if(!SpreadOK()) return;
+   int h=GetHour();
+   if(h<0||h>=Asia_End_Hour) return;
+
+   // Contexto Asia: precio dentro del rango (no en breakout)
+   double bid=SymbolInfoDouble(g_sym,SYMBOL_BID);
+   if(g_asiaReady && (bid>g_asiaHigh+Scalp_SL || bid<g_asiaLow-Scalp_SL)) return;
+
+   ENUM_ORDER_TYPE type=(g_sig==1)?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
+   ulong tk=SendScalp(type,g_sig,"MM7-ASIA");
+   if(tk>0){g_asiaTrades++;g_asiaLastEntry=TimeCurrent();g_sig=0;
+            Print("MM7 ASIA ",g_sig==1?"BUY":"SELL"," scalp #",g_asiaTrades);}
+}
+
+// LONDON: señal EMA en breakout del rango asiático
+void London_TryEntry()
+{
+   if(!London_Enable) return;
+   if(g_sig==0) return;
+   if(g_lonTrades>=London_Max_Trades) return;
+   if(CountByMagic()>0) return;
+   if(TimeCurrent()-g_lonLastEntry<London_Cooldown_Secs) return;
+   if(TimeCurrent()-g_lonLastSL<120) return;
+   if(!SpreadOK()) return;
+   int h=GetHour();
+   if(h<London_Start_Hour||h>=London_End_Hour) return;
+
+   // Contexto London: señal en dirección del breakout del rango asiático
+   double bid=SymbolInfoDouble(g_sym,SYMBOL_BID);
+   if(g_asiaReady)
+   {
+      // BUY solo si precio por encima del rango asiático (breakout alcista)
+      if(g_sig==1  && bid<g_asiaHigh) return;
+      // SELL solo si precio por debajo del rango asiático (breakout bajista)
+      if(g_sig==-1 && bid>g_asiaLow)  return;
+   }
+
+   ENUM_ORDER_TYPE type=(g_sig==1)?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
+   ulong tk=SendScalp(type,g_sig,"MM7-LON");
+   if(tk>0){g_lonTrades++;g_lonLastEntry=TimeCurrent();g_sig=0;
+            Print("MM7 LON scalp #",g_lonTrades);}
+}
+
+// NY: señal EMA pura — el edge probado
+void NY_TryEntry()
+{
+   if(!NY_Enable) return;
+   if(g_sig==0) return;
+   if(g_nyTrades>=NY_Max_Trades) return;
+   if(CountByMagic()>0) return;
+   if(TimeCurrent()-g_nyLastEntry<NY_Cooldown_Secs) return;
+   if(TimeCurrent()-g_nyLastSL<NY_SL_Cooldown_Secs) return;
+   if(!SpreadOK()) return;
+   int nm=GetNowMin();
+   if(nm<NY_Start_Hour*60+NY_Start_Min||nm>=NY_End_Hour*60+NY_End_Min) return;
+
+   ENUM_ORDER_TYPE type=(g_sig==1)?ORDER_TYPE_BUY:ORDER_TYPE_SELL;
+   ulong tk=SendScalp(type,g_sig,"MM7-NY");
+   if(tk>0){g_nyTrades++;g_nyLastEntry=TimeCurrent();g_sig=0;
+            Print("MM7 NY scalp #",g_nyTrades);}
+}
+
+//============================================================
+// OnTradeTransaction
+//============================================================
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &req,const MqlTradeResult &res)
+{
+   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
+   if(trans.deal_type!=DEAL_TYPE_BUY&&trans.deal_type!=DEAL_TYPE_SELL) return;
+   ulong dk=trans.deal;
+   if(!HistoryDealSelect(dk)) return;
+   if((int)HistoryDealGetInteger(dk,DEAL_MAGIC)!=g_magic) return;
+   if(HistoryDealGetInteger(dk,DEAL_ENTRY)!=DEAL_ENTRY_OUT) return;
+   if((ENUM_DEAL_REASON)HistoryDealGetInteger(dk,DEAL_REASON)!=DEAL_REASON_SL) return;
+   string cmt=HistoryDealGetString(dk,DEAL_COMMENT);
+   datetime now=TimeCurrent();
+   if(StringFind(cmt,"ASIA")>=0) g_asiaLastSL=now;
+   if(StringFind(cmt,"LON") >=0) g_lonLastSL=now;
+   if(StringFind(cmt,"NY")  >=0) g_nyLastSL=now;
+}
+
+//============================================================
+// DASHBOARD
+//============================================================
+void DashLbl(string nm,string txt,color clr,int row)
+{
+   string f="MM7D_"+nm; int lh=Font_Size+4;
+   if(ObjectFind(0,f)<0){
+      ObjectCreate(0,f,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,f,OBJPROP_CORNER,(ENUM_BASE_CORNER)Dashboard_Corner);
+      ObjectSetInteger(0,f,OBJPROP_XDISTANCE,Dashboard_X);
+      ObjectSetString(0,f,OBJPROP_FONT,"Courier New");
+      ObjectSetInteger(0,f,OBJPROP_FONTSIZE,Font_Size);
+   }
+   ObjectSetInteger(0,f,OBJPROP_YDISTANCE,Dashboard_Y+row*lh);
+   ObjectSetString(0,f,OBJPROP_TEXT,txt);
+   ObjectSetInteger(0,f,OBJPROP_COLOR,clr);
+}
+
+void DrawDashboard()
+{
+   if(!Enable_Dashboard||TimeCurrent()-g_lastDash<1) return;
+   g_lastDash=TimeCurrent();
+   double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+   double eq =AccountInfoDouble(ACCOUNT_EQUITY);
+   double dd =(g_dayStartBal>0)?(g_dayStartBal-eq)/g_dayStartBal*100.0:0;
+   datetime ds=StringToTime(TimeToString(TimeCurrent(),TIME_DATE));
+   double dp=0; HistorySelect(ds,TimeCurrent());
+   for(int i=0;i<HistoryDealsTotal();i++){
+      ulong dk=HistoryDealGetTicket(i);
+      if((int)HistoryDealGetInteger(dk,DEAL_MAGIC)==g_magic)
+         dp+=HistoryDealGetDouble(dk,DEAL_PROFIT);
+   }
+   int h=GetHour(); int nm=GetNowMin();
+   string sess="---"; color sc=clrGray;
+   if(h>=0&&h<Asia_End_Hour)                                              {sess="ASIA  scalp";sc=clrDodgerBlue;}
+   else if(h>=London_Start_Hour&&h<London_End_Hour)                       {sess="LONDON scalp";sc=clrOrange;}
+   else if(nm>=NY_Start_Hour*60+NY_Start_Min&&nm<NY_End_Hour*60+NY_End_Min){sess="NY scalp";sc=clrLimeGreen;}
+
+   DashLbl("0","[ MoneyMachine7 v17.17 — SCALPING TRI-SESSION ]",clrGold,0);
+   DashLbl("1","Sesion: "+sess+" | SL="+DoubleToString(Scalp_SL,2)+"pt TP="+DoubleToString(Scalp_TP,2)+"pt R:R=1:2",sc,1);
+   DashLbl("2","Bal:$"+DoubleToString(bal,2)+" Eq:$"+DoubleToString(eq,2)+" lot="+DoubleToString(CalcLot(),2),clrWhite,2);
+   DashLbl("3","Day:$"+DoubleToString(dp,2)+" DD:"+DoubleToString(dd,2)+"%",(dp>=0)?clrLimeGreen:clrOrangeRed,3);
+   DashLbl("4","ASIA  tr:"+IntegerToString(g_asiaTrades)+"/"+IntegerToString(Asia_Max_Trades)
+              +" H:"+DoubleToString(g_asiaHigh,2)+" L:"+DoubleToString(g_asiaLow>=1e9?0:g_asiaLow,2),clrDodgerBlue,4);
+   DashLbl("5","LON   tr:"+IntegerToString(g_lonTrades)+"/"+IntegerToString(London_Max_Trades),clrOrange,5);
+   DashLbl("6","NY    tr:"+IntegerToString(g_nyTrades)+"/"+IntegerToString(NY_Max_Trades),clrLimeGreen,6);
+   string sigStr=(g_sig==1)?"BUY":(g_sig==-1)?"SELL":"--";
+   DashLbl("7","Sig:"+sigStr+" EMAf:"+DoubleToString(g_EMAf,2)+" EMAs:"+DoubleToString(g_EMAs,2)
+              +" Halt:"+(g_haltedToday?"SI":"no"),clrGray,7);
+}
+
+void DrawHistoryLabels()
+{
+   if(!Enable_History_Labels||TimeCurrent()-g_lastLabel<10) return;
+   g_lastLabel=TimeCurrent();
+   ObjectsDeleteAll(0,"MM7L_");
+   datetime ds=StringToTime(TimeToString(TimeCurrent(),TIME_DATE));
+   HistorySelect(ds,TimeCurrent());
+   int tot=HistoryDealsTotal(),st=MathMax(0,tot-50);
+   for(int i=st;i<tot;i++){
+      ulong dk=HistoryDealGetTicket(i);
+      if((int)HistoryDealGetInteger(dk,DEAL_MAGIC)!=g_magic) continue;
+      if(HistoryDealGetInteger(dk,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+      double pf=HistoryDealGetDouble(dk,DEAL_PROFIT);
+      double px=HistoryDealGetDouble(dk,DEAL_PRICE);
+      datetime t=(datetime)HistoryDealGetInteger(dk,DEAL_TIME);
+      string nm2="MM7L_"+(string)dk;
+      if(ObjectFind(0,nm2)<0) ObjectCreate(0,nm2,OBJ_TEXT,0,t,px);
+      ObjectSetString(0,nm2,OBJPROP_TEXT,(pf>=0?"+":"")+DoubleToString(pf,2));
+      ObjectSetInteger(0,nm2,OBJPROP_COLOR,(pf>=0)?clrLimeGreen:clrOrangeRed);
+      ObjectSetInteger(0,nm2,OBJPROP_FONTSIZE,8);
+   }
+}
+
+//============================================================
+// OnInit / OnDeinit / OnTick
+//============================================================
+int OnInit()
+{
+   g_magic=InpMagicNumber; g_sym=_Symbol;
+   g_point=SymbolInfoDouble(g_sym,SYMBOL_POINT);
+   if(g_point<=0){Alert("Invalid SYMBOL_POINT");return INIT_FAILED;}
+   g_hEMAf=iMA(g_sym,_Period,EMA_Fast, 0,MODE_EMA,PRICE_CLOSE);
+   g_hEMAs=iMA(g_sym,_Period,EMA_Slow, 0,MODE_EMA,PRICE_CLOSE);
+   g_hEMAt=iMA(g_sym,_Period,EMA_Trend,0,MODE_EMA,PRICE_CLOSE);
+   if(g_hEMAf==INVALID_HANDLE||g_hEMAs==INVALID_HANDLE||g_hEMAt==INVALID_HANDLE)
+   {Alert("EMA init failed");return INIT_FAILED;}
+   g_dayStart   =StringToTime(TimeToString(TimeCurrent(),TIME_DATE));
+   g_dayStartBal=MathMin(AccountInfoDouble(ACCOUNT_BALANCE),AccountInfoDouble(ACCOUNT_EQUITY));
+   g_asiaLow=1e10;
+   Print("MM7 v17.17 SCALPING TRI-SESSION | SL=",Scalp_SL,"pt TP=",Scalp_TP,"pt R:R=1:2");
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0,"MM7D_"); ObjectsDeleteAll(0,"MM7L_");
+   if(g_hEMAf!=INVALID_HANDLE) IndicatorRelease(g_hEMAf);
+   if(g_hEMAs!=INVALID_HANDLE) IndicatorRelease(g_hEMAs);
+   if(g_hEMAt!=INVALID_HANDLE) IndicatorRelease(g_hEMAt);
+}
+
+void OnTick()
+{
+   DailyReset(); CheckHalt();
+   DrawDashboard(); DrawHistoryLabels();
+   if(g_haltedToday||!Control_orders_user) return;
+
+   // Guard de barra — toda la lógica de señal y entrada: una vez por barra
+   datetime curBar=iTime(g_sym,_Period,0);
+   if(curBar==g_lastBar) return;
+   g_lastBar=curBar;
+
+   BuildAsiaRange();
+   CalcSignal();
+
+   int h=GetHour(); int nm=GetNowMin();
+   if(h>=0&&h<Asia_End_Hour)
+      Asia_TryEntry();
+   else if(h>=London_Start_Hour&&h<London_End_Hour)
+      London_TryEntry();
+   else if(nm>=NY_Start_Hour*60+NY_Start_Min&&nm<NY_End_Hour*60+NY_End_Min)
+      NY_TryEntry();
+}
